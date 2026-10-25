@@ -496,10 +496,14 @@ class ResPartner(models.Model):
                        ON TRUE
                     WHERE move.state NOT IN ('draft', 'cancel')
                       AND move.company_id IN %(company_ids)s
-                      AND move.partner_id IN %(partner_ids)s
+                      AND move.partner_id IN (
+                          SELECT id FROM res_partner WHERE id IN %(partner_ids)s
+                          OR id IN (SELECT id FROM res_partner WHERE child_of %(partner_ids_parent_child_ids)s)
+                      )
                       AND move.move_type IN ('out_invoice', 'out_refund')
                     GROUP BY move.partner_id""",
                 partner_ids=tuple(self.ids),
+                partner_ids_parent_child_ids=tuple(self.search([('id', 'child_of', self.ids)]).ids),
                 company_ids=tuple(self.env.companies.ids),
                 default_company_id=self.env.company.id,
             ))
