@@ -447,16 +447,15 @@ class HTML_Editor(Controller):
                 # empty record set.
                 request.env[fields['res_model']].browse(fields['res_id']).check_access('write')
 
-                mimetype_exempt = any(
-                    request.env.user.has_group(group) for group in attachment._get_mimetype_exempt_groups()
-                )
-                if not mimetype_exempt:
-                    request.env['ir.ui.view'].sudo(False).check_access('write')
-
                 # Sudo because restricted editor will not be able to copy the record
                 attachment = attachment.sudo().copy(fields).sudo(False)
                 # Override mimetype with SUPERUSER if it was forced to plain text
                 if attachment.mimetype == 'text/plain' != fields['mimetype']:
+                    mimetype_exempt = any(
+                        request.env.user.has_group(group) for group in attachment._get_mimetype_exempt_groups()
+                    )
+                    if not mimetype_exempt:
+                        request.env['ir.ui.view'].sudo(False).check_access('write')
                     attachment.with_user(SUPERUSER_ID).mimetype = fields['mimetype']
             return attachment
 
@@ -733,9 +732,14 @@ class HTML_Editor(Controller):
             document.check_field_access(field, 'read')
             document.check_field_access(field, 'write')
 
-        channel = (request.db, 'editor_collaboration', model_name, field_name, int(res_id))
-        bus_data.update({'model_name': model_name, 'field_name': field_name, 'res_id': res_id})
-        request.env['bus.bus']._sendone(channel, 'editor_collaboration', bus_data)
+        base_channel = (request.db, 'editor_collaboration', model_name, field_name, int(res_id))
+        for data in bus_data if isinstance(bus_data, list) else [bus_data]:
+            data.update({'model_name': model_name, 'field_name': field_name, 'res_id': res_id})
+            if to_peer_id := data.get('toPeerId'):
+                channel = (*base_channel, str(to_peer_id))
+            else:
+                channel = base_channel
+            request.env['bus.bus']._sendone(channel, 'editor_collaboration', data)
 
     @route('/html_editor/link_preview_external', type="jsonrpc", auth="public", methods=['POST'])
     def link_preview_metadata(self, preview_url):

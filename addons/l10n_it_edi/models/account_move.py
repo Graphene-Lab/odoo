@@ -15,6 +15,7 @@ from odoo.tools import BinaryBytes, cleanup_xml_node, float_compare, float_is_ze
 from stdnum.it import codicefiscale, iva
 
 from odoo import _, api, Command, fields, models, modules
+from odoo.addons.base.models.res_partner_bank import sanitize_account_number
 from odoo.addons.account_edi_proxy_client.models.account_edi_proxy_user import AccountEdiProxyError
 from odoo.addons.l10n_it_edi.models.account_payment_method_line import L10N_IT_PAYMENT_METHOD_SELECTION
 from odoo.addons.l10n_it_edi.tools.remove_signature import remove_signature
@@ -1263,29 +1264,43 @@ class AccountMove(models.Model):
     # EDI: Import
     # -------------------------------------------------------------------------
 
-    def cron_l10n_it_edi_download_and_update(self):
-        """ Crons run with sudo(), with empty recordset. Remember that. """
-        retrigger = False
-        for proxy_user in self.env['account_edi_proxy_client.user'].search([('proxy_type', '=', 'l10n_it_edi')]):
-            proxy_user = proxy_user.with_company(proxy_user.company_id)
-            if proxy_user.edi_mode != 'demo':
-                moves_to_check = self.search([
-                    ('company_id', '=', proxy_user.company_id.id),
-                    ('l10n_it_edi_transaction', '!=', False),
-                    *Domain.OR(
-                        [[('l10n_it_edi_state', 'in', WAITING_STATES)],
-                        Domain.AND(
-                            [
-                                [('l10n_it_edi_state', '=', 'forwarded')],
-                                [('commercial_partner_id.l10n_it_pa_index', '=ilike', '_' * 6)],
-                            ]
-                        )]
-                    )
-                ])
-                if moves_to_check:
-                    moves_to_check._l10n_it_edi_update_send_state()
-                retrigger = retrigger or self._l10n_it_edi_download_invoices(proxy_user)
+    @api.model
+    def _l10n_it_edi_check_send_state(self, companies=None):
+        """ Updates the SdI state of moves waiting for a response. """
+        domain = [
+            ('l10n_it_edi_transaction', '!=', False),
+            *Domain.OR([
+                [('l10n_it_edi_state', 'in', WAITING_STATES)],
+                Domain.AND([
+                    [('l10n_it_edi_state', '=', 'forwarded')],
+                    [('commercial_partner_id.l10n_it_pa_index', '=ilike', '_' * 6)],
+                ]),
+            ]),
+        ]
+        if companies:
+            domain.append(('company_id', 'in', companies.ids))
 
+        if moves_to_check := self.search(domain):
+            for company_moves in moves_to_check.grouped('company_id').values():
+                company_moves._l10n_it_edi_update_send_state()
+
+        return {'type': 'ir.actions.client', 'tag': 'reload'}
+
+    def cron_l10n_it_edi_download_and_update(self, companies=None):
+        """ Crons run with sudo(), with empty recordset. Remember that. """
+        domain = [
+            ('proxy_type', '=', 'l10n_it_edi'),
+            ('edi_mode', '!=', 'demo'),
+        ]
+        if companies:
+            domain.append(('company_id', 'in', companies.ids))
+
+        retrigger = False
+        proxy_users = self.env['account_edi_proxy_client.user'].search(domain)
+        self.env['account.move']._l10n_it_edi_check_send_state(proxy_users.company_id)
+
+        for proxy_user in proxy_users:
+            retrigger = retrigger or self._l10n_it_edi_download_invoices(proxy_user)
         # Retrigger download if there are still some on the server
         if retrigger:
             _logger.info('Retriggering "Receive invoices from the SdI"...')
@@ -1807,12 +1822,27 @@ class AccountMove(models.Model):
             payments_info = self._l10n_it_edi_get_payment_info(tree)
             if payments_info['info']:
                 message_to_log.append(_("Total amount from the XML File: %s", payments_info['amount_total']))
+                # Search / Create the bank account only on incoming docs,
+                # unless the IBAN is one of ours (e.g. RiBa, where it's the debtor's one)
+                if self.move_type not in ('out_invoice', 'in_refund'):
+                    ibans = {
+                        sanitize_account_number(iban): iban
+                        for payment_info in payments_info['info']
+                        if (iban := payment_info.get('account_number'))
+                    }
+                    existing_ibans = {
+                        bank['sanitized_account_number']
+                        for bank in self.env['res.partner.bank'].sudo().with_context(active_test=False).search_read([
+                            ('sanitized_account_number', 'in', list(ibans)),
+                            ('partner_id', 'in', self.env['res.company']._cached_data()['partner_id']),
+                        ], ['sanitized_account_number'])
+                    }
+                    for sanitized_iban, iban in ibans.items():
+                        if sanitized_iban not in existing_ibans:
+                            self.env['account.edi.common'].with_company(company)._import_partner_bank(self, [iban])
                 payment_due_dates = []
                 self.l10n_it_payment_method = False
                 for payment_info in payments_info['info']:
-                    # Search / Create the bank account only on incoming docs
-                    if self.move_type not in ('out_invoice', 'in_refund') and (iban := payment_info.get('account_number')):
-                        self.env['account.edi.common'].with_company(company)._import_partner_bank(self, [iban])
                     # Set payment data on the bill
                     self.payment_reference = self.payment_reference or payment_info.get('payment_code', False)
                     payment_due_dates.append(payment_info.get('invoice_date_due'))

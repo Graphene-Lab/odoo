@@ -30,6 +30,7 @@ import { CALL_GRID_LAYOUT } from "@mail/discuss/call/common/call_layout";
 import {
     CROSS_TAB_CLIENT_MESSAGE,
     CROSS_TAB_HOST_MESSAGE,
+    CROSS_TAB_INIT_TIMEOUT,
     Rtc,
 } from "@mail/discuss/call/common/rtc_service";
 import { ChannelMember } from "@mail/discuss/core/common/channel_member_model";
@@ -41,6 +42,7 @@ import {
     beforeEach,
     describe,
     expect,
+    freezeTime,
     hover,
     manuallyDispatchProgrammaticEvent,
     mockDate,
@@ -64,6 +66,7 @@ import { isMobileOS } from "@web/core/browser/feature_detection";
 import { patch } from "@web/core/utils/patch";
 import { deserializeDateTime } from "@web/core/l10n/dates";
 import { user } from "@web/core/user";
+import { redirect } from "@web/core/utils/urls";
 
 describe.current.tags("desktop");
 defineMailModels();
@@ -517,7 +520,6 @@ test("show call UI in chat window when in call", async () => {
 test("joining a video call from a chat window opens the wide meeting view", async () => {
     const { isBrowserFullscreen } = mockBrowserFullscreen();
     const pyEnv = await startServer();
-    onRpc("/mail/rtc/session/notify_call_members", () => true);
     const partnerId = pyEnv["res.partner"].create({ name: "Partner 2" });
     pyEnv["res.users"].create({ partner_id: partnerId });
     const channelId = pyEnv["discuss.channel"].create({
@@ -552,7 +554,6 @@ test("joining a video call from a chat window opens the wide meeting view", asyn
 test("starting a video call from a chat window opens the wide meeting view", async () => {
     const { isBrowserFullscreen } = mockBrowserFullscreen();
     const pyEnv = await startServer();
-    onRpc("/mail/rtc/session/notify_call_members", () => true);
     const partnerId = pyEnv["res.partner"].create({ name: "Partner 2" });
     pyEnv["res.users"].create({ partner_id: partnerId });
     pyEnv["discuss.channel"].create({
@@ -579,7 +580,6 @@ test("starting a video call from a chat window opens the wide meeting view", asy
 test("starting a video call from the Discuss app opens the wide meeting view", async () => {
     const { isBrowserFullscreen } = mockBrowserFullscreen();
     const pyEnv = await startServer();
-    onRpc("/mail/rtc/session/notify_call_members", () => true);
     const channelId = pyEnv["discuss.channel"].create({ name: "General" });
     await start();
     await openDiscuss(channelId);
@@ -594,7 +594,6 @@ test("starting a video call from the Discuss app opens the wide meeting view", a
 
 test("starting a plain call from the Discuss app stays inline (no meeting view)", async () => {
     const pyEnv = await startServer();
-    onRpc("/mail/rtc/session/notify_call_members", () => true);
     const channelId = pyEnv["discuss.channel"].create({ name: "General" });
     await start();
     mockService("mail.sound_effects", {
@@ -864,6 +863,32 @@ test("Inset card is hidden when sidebar is open", async () => {
     await click(".o-discuss-ChangeLayoutDialog-option:contains('Spotlight')");
     expect(store.settings.callLayout).toBe(CALL_GRID_LAYOUT.SPOTLIGHT);
     await contains(".o-discuss-CallParticipantCard.o-inset");
+});
+
+test("Inset card removed while being dragged", async () => {
+    mockGetMedia();
+    const pyEnv = await startServer();
+    const channelId = pyEnv["discuss.channel"].create({ name: "General" });
+    const env = await start();
+    const rtc = env.services["discuss.rtc"];
+    await openDiscuss(channelId);
+    await click("[title='Start Call']");
+    await click("[title='Share Screen']");
+    await click("[title='Turn camera on']");
+    await contains("video[type='camera'].o-inset");
+    await manuallyDispatchProgrammaticEvent(
+        queryFirst(".o-discuss-CallParticipantCard.o-inset"),
+        "mousedown"
+    );
+    await rtc.toggleVideo("screen", false);
+    await contains("video[type='camera']:not(.o-inset)");
+    await contains(".o-discuss-CallParticipantCard.o-inset", { count: 0 });
+    const cameraCardEl = queryFirst(".o-discuss-CallParticipantCard:has(video[type='camera'])");
+    const cameraCardTransform = cameraCardEl.style.transform;
+    await manuallyDispatchProgrammaticEvent(document, "mousemove", { clientX: 10, clientY: 10 });
+    await manuallyDispatchProgrammaticEvent(document, "mousemove", { clientX: 200, clientY: 150 });
+    expect(cameraCardEl.style.transform).toBe(cameraCardTransform);
+    await manuallyDispatchProgrammaticEvent(document, "mouseup");
 });
 
 test("join/leave sounds are only played on main tab", async () => {
@@ -1683,6 +1708,99 @@ test("Cross tab calls: tabs can interact with calls remotely", async () => {
     await expect.waitForSteps(["is_muted:true"]);
 });
 
+test("Cross tab calls: opening the fullscreen URL of the hosted call does not leave it", async () => {
+    const pyEnv = await startServer();
+    const channelId = pyEnv["discuss.channel"].create({
+        default_display_mode: "video_full_screen",
+        name: "Meeting",
+    });
+    const sessionId = pyEnv["discuss.channel.rtc.session"].create({
+        channel_member_id: pyEnv["discuss.channel.member"].search([
+            ["channel_id", "=", channelId],
+        ])[0],
+        channel_id: channelId,
+    });
+    const broadcastChannel = new BroadcastChannel("call_sync_state");
+    broadcastChannel.onmessage = (event) => {
+        if (event.data.type === CROSS_TAB_CLIENT_MESSAGE.INIT) {
+            broadcastChannel.postMessage({
+                type: CROSS_TAB_HOST_MESSAGE.UPDATE_REMOTE,
+                hostedChannelId: channelId,
+                hostedSessionId: sessionId,
+                changes: { [sessionId]: { is_deaf: false, is_muted: false } },
+            });
+        }
+        if (event.data.type === CROSS_TAB_CLIENT_MESSAGE.LEAVE) {
+            expect.step("leave");
+        }
+    };
+    redirect("?fullscreen=1");
+    const env = await start();
+    await waitUntil(() => env.services["mail.store"].rtc.isRemote);
+    await openDiscuss(channelId);
+    await contains(".o-mail-Meeting .o-discuss-Call");
+    await expect.waitForSteps([]);
+});
+
+test("Cross tab calls: opening the fullscreen URL waits for the host tab to answer", async () => {
+    const pyEnv = await startServer();
+    const channelId = pyEnv["discuss.channel"].create({
+        default_display_mode: "video_full_screen",
+        name: "Meeting",
+    });
+    const sessionId = pyEnv["discuss.channel.rtc.session"].create({
+        channel_member_id: pyEnv["discuss.channel.member"].search([
+            ["channel_id", "=", channelId],
+        ])[0],
+        channel_id: channelId,
+    });
+    onRpc("/mail/rtc/channel/join_call", () => expect.step("join_call"));
+    const broadcastChannel = new BroadcastChannel("call_sync_state");
+    broadcastChannel.onmessage = (event) => {
+        if (event.data.type === CROSS_TAB_CLIENT_MESSAGE.INIT) {
+            expect.step("init");
+        }
+        if (event.data.type === CROSS_TAB_CLIENT_MESSAGE.LEAVE) {
+            expect.step("leave");
+        }
+    };
+    redirect("?fullscreen=1");
+    freezeTime();
+    const env = await start({ waitUntilSubscribe: false });
+    await expect.waitForSteps(["init"]);
+    await openDiscuss(channelId);
+    await advanceTime(CROSS_TAB_INIT_TIMEOUT / 2);
+    expect(env.services["mail.store"].discuss.hasRestoredThread).toBe(true);
+    broadcastChannel.postMessage({
+        type: CROSS_TAB_HOST_MESSAGE.UPDATE_REMOTE,
+        hostedChannelId: channelId,
+        hostedSessionId: sessionId,
+        changes: { [sessionId]: { is_deaf: false, is_muted: false } },
+    });
+    await contains(".o-mail-Meeting.o-fullscreen .o-discuss-Call");
+    await expect.waitForSteps([]);
+});
+
+test("Cross tab calls: opening the fullscreen URL joins when no tab hosts the call", async () => {
+    const pyEnv = await startServer();
+    const channelId = pyEnv["discuss.channel"].create({
+        default_display_mode: "video_full_screen",
+        name: "Meeting",
+    });
+    pyEnv["discuss.channel.rtc.session"].create({
+        channel_member_id: pyEnv["discuss.channel.member"].search([
+            ["channel_id", "=", channelId],
+        ])[0],
+        channel_id: channelId,
+    });
+    onRpc("/mail/rtc/channel/join_call", () => expect.step("join_call"));
+    redirect("?fullscreen=1");
+    await start();
+    await openDiscuss(channelId);
+    await advanceTime(CROSS_TAB_INIT_TIMEOUT);
+    await expect.waitForSteps(["join_call"]);
+});
+
 test("automatically cancel incoming call after some time", async () => {
     const pyEnv = await startServer();
     const channelId = pyEnv["discuss.channel"].create({ name: "General" });
@@ -1778,7 +1896,6 @@ test("shows warning on infinite mirror effect (screen-sharing then fullscreen)",
 
 test("single 'join' (without camera) button when last call was audio-only", async () => {
     const pyEnv = await startServer();
-    onRpc("/mail/rtc/session/notify_call_members", () => true);
     const alfredPartnerId = pyEnv["res.partner"].create({ name: "Alfred" });
     const channelId = pyEnv["discuss.channel"].create({
         channel_type: "chat",
@@ -1805,7 +1922,6 @@ test("single 'join' (without camera) button when last call was audio-only", asyn
 
 test("single 'join' (with camera) button when last call had camera on", async () => {
     const pyEnv = await startServer();
-    onRpc("/mail/rtc/session/notify_call_members", () => true);
     const alfredPartnerId = pyEnv["res.partner"].create({ name: "Alfred" });
     const channelId = pyEnv["discuss.channel"].create({
         channel_type: "chat",

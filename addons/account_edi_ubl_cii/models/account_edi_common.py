@@ -588,6 +588,18 @@ class AccountEdiCommon(models.AbstractModel):
     # Import invoice
     # -------------------------------------------------------------------------
 
+    def _import_fix_line_price_unit_quantity_discount(self, quantity, discount, price_unit, line_total_amount, currency):
+        """ Recompute the quantity, discount and price unit so the line subtotal matches the line total amount
+        (LineExtensionAmount in UBL, LineTotalAmount in CII).
+        """
+        # TODO remove when France enforce stricter rules
+        current_line_subtotal = (1 - discount / 100) * (quantity * price_unit)
+        if not currency.is_zero((line_total_amount or 0.0) - current_line_subtotal):
+            quantity = quantity or 1
+            discount = 0
+            price_unit = (line_total_amount or 0.0) / quantity
+        return quantity, discount, price_unit
+
     def _import_invoice_ubl_cii(self, invoice, file_data, new=False):
         invoice.ensure_one()
         if invoice.invoice_line_ids:
@@ -669,10 +681,9 @@ class AccountEdiCommon(models.AbstractModel):
             attachment_data = document.find('{*}Attachment/{*}EmbeddedDocumentBinaryObject')
             if attachment_name is not None and attachment_data is not None:
                 mimetype = attachment_data.attrib.get('mimeCode')
-                if not (extension := SUPPORTED_FILE_TYPES.get(mimetype)):
-                    continue
                 # Strip internal newlines/spaces to prevent 'raw' field validation failure on create
-                text = ''.join((attachment_data.text or '').split())
+                if not (extension := SUPPORTED_FILE_TYPES.get(mimetype)) or not (text := ''.join((attachment_data.text or '').split())):
+                    continue
                 # Normalize the name of the file : some e-fff emitters put the full path of the file
                 # (Windows or Linux style) and/or the name of the xml instead of the pdf.
                 # Get only the filename with the right extension.
@@ -926,10 +937,10 @@ class AccountEdiCommon(models.AbstractModel):
             if start_date_node is not None and end_date_node is not None:  # there is a constraint forcing none or the two to be set
                 start_date = datetime.strptime(start_date_node.text.strip(), xpath_dict['date_format'])
                 end_date = datetime.strptime(end_date_node.text.strip(), xpath_dict['date_format'])
-        deferred_values = {
-            'deferred_start_date': start_date,
-            'deferred_end_date': end_date,
-        }
+                deferred_values = {
+                    'deferred_start_date': start_date,
+                    'deferred_end_date': end_date,
+                }
         line_vals = self._retrieve_line_vals(record, tree, document_type, qty_factor)
         if not line_vals.get('price_subtotal'):
             return None
@@ -1389,10 +1400,9 @@ class AccountEdiCommon(models.AbstractModel):
     def _import_retrieve_customer(self, collected_values):
         company = collected_values['company']
         customer_values = collected_values['customer_values']
-        customer_values.update({
-            'account_numbers': collected_values.get('partner_bank_values', {}).get('account_numbers'),
-            'company': company,
-        })
+        customer_values['company'] = company
+        if collected_values['invoice'].move_type in ('out_refund', 'in_invoice'):
+            customer_values['account_numbers'] = collected_values.get('partner_bank_values', {}).get('account_numbers')
         self.env['res.partner']._import_retrieve_customer(
             search_plan=self._import_retrieve_customer_search_plan(collected_values),
             company=company,
@@ -1444,18 +1454,19 @@ class AccountEdiCommon(models.AbstractModel):
 
         vat_mismatch = False
         if customer:
+            country = self._import_retrieve_country(collected_values)
             if not customer.vat:
-                country = self._import_retrieve_country(collected_values)
                 customer.vat, _country_code = self.env['res.partner']._run_vat_checks(country, vat, validation='setnull')
                 return
-            if self._check_customer_vat_match(customer, vat, collected_values):
+            country_mismatch = bool(country and customer.country_id and customer.country_id != country)
+            if not country_mismatch and self._check_customer_vat_match(customer, vat, collected_values):
                 return
             vat_mismatch = True
 
         partner_create_values = self._import_prepare_missing_customer_create_values(collected_values)
         customer = self.env['res.partner'].create(partner_create_values)
         if vat_mismatch:
-            logs.append(_("Could not retrieve a partner corresponding to '%s' with the same VAT. A new partner was created.", name))
+            logs.append(_("Could not retrieve a partner corresponding to '%s' with the same VAT and country. A new partner was created.", name))
         else:
             logs.append(_("Could not retrieve a partner corresponding to '%s'. A new partner was created.", name))
         customer_values['customer'] = customer

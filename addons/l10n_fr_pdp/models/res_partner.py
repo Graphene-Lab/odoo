@@ -40,11 +40,14 @@ class ResPartner(models.Model):
     def fields_get(self, allfields=None, attributes=None):
         # Extend to rename the `peppol` option in the `invoice_sending_method` selection
         fields = super().fields_get(allfields, attributes)
+        # Don't read the company when the selection is not requested: mail tracking calls
+        # fields_get during module installs, when the res.company columns may not exist yet
+        field = fields.get('invoice_sending_method', {})
+        if 'selection' not in field:
+            return fields
         company = self.env.company
-        if not self.env.context.get("studio") and company and company._l10n_fr_pdp_uses_french_terminology() and 'invoice_sending_method' in fields:
-            field = fields['invoice_sending_method']
-            if 'selection' in field:
-                field['selection'] = [('peppol', self.env._('by the Approved Platform')) if option[0] == 'peppol' else option for option in field['selection']]
+        if not self.env.context.get("studio") and company and company._l10n_fr_pdp_uses_french_terminology():
+            field['selection'] = [('peppol', self.env._('by the Approved Platform')) if option[0] == 'peppol' else option for option in field['selection']]
         return fields
 
     # -------------------------------------------------------------------------
@@ -111,7 +114,8 @@ class ResPartner(models.Model):
     def _l10n_fr_pdp_get_siren(self):
         self.ensure_one()
         all_identifiers = self._get_all_identifiers(enrich=True)
-        return all_identifiers.get('FR_SIREN')  # will be deduced by enrich=True if SIRET was set.
+        partner = self.commercial_partner_id or self
+        return all_identifiers.get('FR_SIREN') or (partner.l10n_fr_is_french and partner._l10n_fr_get_siren_from_vat())
 
     def _l10n_fr_pdp_get_siret(self):
         self.ensure_one()
@@ -140,6 +144,11 @@ class ResPartner(models.Model):
         if country_code and self.name:
             return '0227', country_code + self.name[:16]
         return False, False
+
+    @api.model
+    def _import_retrieve_customer_from_siret(self, customer_values):
+        if siret := customer_values.get('siret'):
+            return self._import_retrieve_customer_from_additional_identifiers({'additional_identifiers': {'FR_SIRET': siret}})
 
     def _get_edi_builder(self, invoice_edi_format):
         # EXTENDS 'account_edi_ubl_cii'
@@ -262,27 +271,41 @@ class ResPartner(models.Model):
         if not siren_siret_re.fullmatch(self.routing_endpoint):
             raise UserError(self.env._("endpoint must begin with a 9 or 14 digits number to enable the lookup (ie: siren, siret), followed by an optional suffix starting with an underscore (ie: 123456789_ABC)"))
 
-        edi_mode = self.env.company._get_peppol_edi_mode()
-        origin = self.env['account_edi_proxy_client.user']._get_proxy_urls()['pdp'][edi_mode]
-        endpoint = f'{origin}/api/pdp/1/pdp_annuaire_lookup'
+        result = self._fetch_active_annuaire_lines(self.routing_endpoint[:9], active_only=False, raise_on_error=True)
+        lines = result.get("lines", [])
 
-        response = requests.get(
-            url=endpoint,
-            params={
-                'pdp_endpoint': self.routing_endpoint[:9],  # We only want to take the first 9 char (for the siren)
-            },
-            timeout=10,
-        )
-        response.raise_for_status()
-        data = response.json()
-        if not data.get('annuaire_lines'):
+        if not lines:
             raise UserError(self.env._("No annuaire lines found for that identifier"))
 
         wizard = self.env['l10n_fr_pdp.partner.lookup'].create({
             'available_annuaire_line_ids': [
                 Command.create(line)
-                for line in data['annuaire_lines']
+                for line in lines
             ],
             'partner_id': self.id,
         })
         return wizard._get_records_action(target='new')
+
+    @api.model
+    @handle_demo
+    def _fetch_active_annuaire_lines(self, siren, active_only=True, raise_on_error=False):
+        edi_mode = self.env.company._get_peppol_edi_mode()
+        origin = self.env['account_edi_proxy_client.user']._get_proxy_urls()['pdp'][edi_mode]
+        query = parse.urlencode({'pdp_endpoint': siren, 'active_only': active_only})
+        endpoint = f'{origin}/api/pdp/1/pdp_annuaire_lookup?{query}'
+
+        try:
+            response = requests.get(endpoint, timeout=10)
+            response.raise_for_status()
+            decoded_response = response.json()
+        except (requests.exceptions.RequestException, ValueError) as e:
+            if raise_on_error:
+                raise UserError(self.env._("Failed to query annuaire lines for identifier %(siren)s: %(error)s", siren=siren, error=e))
+            _logger.warning("failed to query active annuaire lines for identifier %s: %s", siren, e)
+            return {}
+
+        lines = decoded_response.get('annuaire_lines', [])
+
+        return {
+            "lines": lines
+        }

@@ -761,6 +761,47 @@ describe("Convert snippets and mailing bodies to tables", () => {
         editable = document.createElement("div");
     });
 
+    test.tags("desktop");
+    test("keep the vertical alignment of a row when stacking its columns", async () => {
+        const wrappersAlignment = async (rowClasses, columnClasses = []) => {
+            editable = document.createElement("div");
+            editable.style.setProperty("width", TEST_WIDTH + "px");
+            getFixture().append(editable);
+            editable.innerHTML = `<div class="container o_mail_wrapper"><div class="row"><div class="col-3"><p>Issue<br><strong>#42</strong></p></div><div class="col-9"><p style="height: 100px">Logo</p></div></div></div>`;
+            editable.querySelector(".row").classList.add(...rowClasses);
+            editable.querySelector(".col-3").classList.add(...columnClasses);
+            await toInline(editable, getCSSRules(document));
+            return {
+                wrappers: [...editable.querySelectorAll("div.o_stacking_wrapper")].map(
+                    (wrapper) => wrapper.style.verticalAlign
+                ),
+                mso: [...editable.innerHTML.matchAll(/valign="(\w+)"/g)].map((match) => match[1]),
+            };
+        };
+        expect(await wrappersAlignment(["align-items-center"])).toEqual(
+            { wrappers: ["middle", "middle"], mso: ["middle", "middle"] },
+            { message: "should have kept the columns vertically centered" }
+        );
+        expect(await wrappersAlignment(["align-items-end"])).toEqual(
+            { wrappers: ["bottom", "bottom"], mso: ["bottom", "bottom"] },
+            { message: "should have kept the columns aligned to the bottom" }
+        );
+        expect(await wrappersAlignment(["align-items-center"], ["align-self-end"])).toEqual(
+            { wrappers: ["bottom", "middle"], mso: ["bottom", "middle"] },
+            { message: "should have aligned a column on its own alignment over the row's" }
+        );
+        expect(
+            await wrappersAlignment(["flex-column", "flex-md-row", "align-items-center"])
+        ).toEqual(
+            { wrappers: ["middle", "middle"], mso: ["middle", "middle"] },
+            { message: "should have kept the columns centered when the row is horizontal" }
+        );
+        expect(await wrappersAlignment(["flex-column", "align-items-center"])).toEqual(
+            { wrappers: ["top", "top"], mso: ["top", "top"] },
+            { message: "should not have read a horizontal alignment as a vertical one" }
+        );
+    });
+
     test("convert snippets to tables", async () => {
         editable.innerHTML = `<div class="o_mail_snippet_general"><div>Snippet</div></div>`;
         addTables(editable);
@@ -1551,7 +1592,7 @@ describe("Should not convert blacklisted class to inline styles", () => {
         classToStyle(editable, getCSSRules(editable.ownerDocument));
 
         expect(editable).toHaveInnerHTML(
-            `<a contenteditable="false" href="#" class="o_mail_redirect" style="text-decoration: none; box-sizing: border-box; overflow-wrap: unset;">@Marc Demo</a> Testing!`,
+            `<a contenteditable="false" href="#" class="o_mail_redirect" style="text-decoration:none;box-sizing:border-box;overflow-wrap:unset;">@Marc Demo</a> Testing!`,
             {
                 message: "blacklisted class styles should remain unconverted",
             }
@@ -1567,8 +1608,61 @@ describe("Should not convert blacklisted class to inline styles", () => {
         editable.innerHTML = `<a contenteditable="false" href="#" class="o_mail_redirect test-style">@Marc Demo</a> Testing!`;
         classToStyle(editable, getCSSRules(editable.ownerDocument));
         expect(editable).toHaveInnerHTML(
-            `<a contenteditable="false" href="#" class="o_mail_redirect test-style" style="text-decoration: none; box-sizing: border-box; background-color: yellow; overflow-wrap: unset;"> @Marc Demo </a> Testing!`,
+            `<a contenteditable="false" href="#" class="o_mail_redirect test-style" style="text-decoration:none;box-sizing:border-box;background-color:yellow;overflow-wrap:unset;"> @Marc Demo </a> Testing!`,
             { message: "styles marked !important should override blacklisted class restrictions" }
+        );
+    });
+
+    test("should not convert blacklisted class of an element in the document", async () => {
+        getFixture().append(editable);
+        editable.innerHTML = `<a contenteditable="false" href="#" class="o_mail_redirect">@Marc Demo</a> Testing!`;
+
+        classToStyle(editable, getCSSRules(editable.ownerDocument));
+
+        const style = editable.querySelector("a").style;
+        const properties = [
+            "border-radius",
+            "display",
+            "font-weight",
+            "margin",
+            "outline-style",
+            "padding",
+            "text-decoration",
+        ];
+        expect(
+            Object.fromEntries(properties.map((name) => [name, style.getPropertyValue(name)]))
+        ).toEqual(
+            {
+                "border-radius": "",
+                display: "",
+                "font-weight": "",
+                margin: "",
+                "outline-style": "",
+                padding: "",
+                "text-decoration": "none",
+            },
+            { message: "only the styles of the blacklisted class should remain unconverted" }
+        );
+    });
+
+    test("should not convert grouped style of a blacklisted class over a class having less specificity", async () => {
+        styleSheet.insertRule(`
+            .test-radius {
+                border-radius: 2px;
+            }
+        `);
+        getFixture().append(editable);
+        editable.innerHTML = `<a contenteditable="false" href="#" class="o_mail_redirect test-radius">@Marc Demo</a> Testing!`;
+
+        classToStyle(editable, getCSSRules(editable.ownerDocument));
+
+        const style = editable.querySelector("a").style;
+        expect({
+            "border-radius": style.getPropertyValue("border-radius"),
+            "text-decoration": style.getPropertyValue("text-decoration"),
+        }).toEqual(
+            { "border-radius": "", "text-decoration": "none" },
+            { message: "a less specific class should not bring back the blacklisted radius" }
         );
     });
 
@@ -1581,7 +1675,7 @@ describe("Should not convert blacklisted class to inline styles", () => {
         editable.innerHTML = `<a contenteditable="false" href="#" class="o_mail_redirect test-color">@Marc Demo</a> Testing!`;
         classToStyle(editable, getCSSRules(editable.ownerDocument));
         expect(editable).toHaveInnerHTML(
-            `<a contenteditable="false" href="#" class="o_mail_redirect test-color" style="text-decoration: none; box-sizing: border-box; overflow-wrap: unset;"> @Marc Demo </a> Testing!`,
+            `<a contenteditable="false" href="#" class="o_mail_redirect test-color" style="text-decoration:none;box-sizing:border-box;overflow-wrap:unset;"> @Marc Demo </a> Testing!`,
             {
                 message:
                     "should ignore styles from lower specificity class in favor of blacklisted class",

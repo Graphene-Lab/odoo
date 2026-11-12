@@ -1520,12 +1520,12 @@ class TransactionCase(BaseCase):
 
             report_model = self.env.registry['ir.actions.report']
             try:
-                old_run_wkhtmltopdf = report_model._run_wkhtmltopdf
+                old_run_wkhtmltopdf = report_model._run_wkhtmltopdf__
             except AttributeError:
                 pass
             else:
                 stack.enter_context(
-                    patch.object(report_model, '_run_wkhtmltopdf', _patched_run_wkhtmltopdf),
+                    patch.object(report_model, '_run_wkhtmltopdf__', _patched_run_wkhtmltopdf),
                 )
             yield
 
@@ -2654,12 +2654,12 @@ class HttpCase(TransactionCase):
 
         report_model = self.env.registry['ir.actions.report']
         try:
-            old_run_wkhtmltopdf = report_model._run_wkhtmltopdf
+            old_run_wkhtmltopdf = report_model._run_wkhtmltopdf__
         except AttributeError:
             pass
         else:
             self.startPatcher(
-                patch.object(report_model, '_run_wkhtmltopdf', _patched_run_wkhtmltopdf),
+                patch.object(report_model, '_run_wkhtmltopdf__', _patched_run_wkhtmltopdf),
             )
 
     @contextmanager
@@ -2758,6 +2758,8 @@ class HttpCase(TransactionCase):
 
         while real_time() < end_time:
             time.sleep(0.1)
+            if not get_http_request_threads():
+                break
 
         request_threads = get_http_request_threads()
         for thread in request_threads:
@@ -2767,6 +2769,8 @@ class HttpCase(TransactionCase):
         if request_threads:
             self._logger.info('remaining requests')
             odoo.tools.misc.dumpstacks()
+        else:
+            self._logger.info('All HTTP requests finished')
 
     def logout(self, keep_db=True):
         logout(self.session, keep_db=keep_db)

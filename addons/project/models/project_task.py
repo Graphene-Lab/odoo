@@ -6,14 +6,12 @@ from collections import defaultdict
 from datetime import timedelta, datetime, time, UTC
 from random import shuffle
 
-from lxml import html
-
 from odoo import api, fields, models, tools, SUPERUSER_ID, _
 from odoo.fields import Command, Date, Domain
 from odoo.addons.rating.models import rating_data
 from odoo.addons.html_editor.tools import handle_history_divergence
 from odoo.exceptions import UserError, ValidationError, AccessError
-from odoo.tools import format_list, SQL, LazyTranslate, html_sanitize
+from odoo.tools import format_list, SQL, LazyTranslate
 from odoo.addons.project.controllers.project_sharing_chatter import ProjectSharingChatter
 from odoo.addons.mail.tools.discuss import Store
 
@@ -716,6 +714,11 @@ class ProjectTask(models.Model):
             else:
                 task.stage_id = False
 
+    @api.onchange('stage_id')
+    def _onchange_stage_id(self):
+        if self.state not in CLOSED_STATES and self.state != '04_waiting_normal' and self.stage_id != self._origin.stage_id:
+            self.state = '01_in_progress'
+
     @api.depends('user_ids')
     def _compute_portal_user_names(self):
         """ This compute method allows to see all the names of assigned users to each task contained in `self`.
@@ -909,7 +912,15 @@ class ProjectTask(models.Model):
                 if copy_from_template:
                     current_task = current_task.with_context(active_test=True)
                 child_ids = current_task.child_ids
-                vals['child_ids'] = [Command.create(child_id.copy_data(default)[0]) for child_id in child_ids.filtered(lambda c: c.active)]
+                default_without_project = {key: value for key, value in default.items() if key != 'project_id'}
+                vals['child_ids'] = [
+                    Command.create(child.copy_data(
+                        default_without_project
+                        if child.project_id and child.project_id != current_task.project_id
+                        else default,
+                    )[0])
+                    for child in child_ids.filtered('active')
+                ]
             if not has_default_users and vals['user_ids']:
                 task_active_users = task.user_ids & active_users
                 vals['user_ids'] = [Command.set(task_active_users.ids)]
@@ -1195,6 +1206,8 @@ class ProjectTask(models.Model):
         if is_portal_user:
             child_ids_list = []
         for vals, additional_vals in zip(vals_list, additional_vals_list):
+            if 'priority' in vals and not vals['priority']:
+                vals['priority'] = '0'
             project_id = vals.get('project_id') or default_project_id
 
             if vals.get('user_ids'):
@@ -1811,23 +1824,8 @@ class ProjectTask(models.Model):
            and message.subtype_id == self._creation_subtype()
            and self.partner_id == message.author_id
            and message.message_type == 'email'
-           and message.body  # TDE FIXME: use html empty
         ):
-            # Remove the signature from the email body
-            source_html = message.body
-            doc = html.fromstring(source_html)
-
-            signature_xpath = (
-                '//*[@data-o-mail-quote="1"] | '
-                '//span[normalize-space(.) = "--"]'
-            )
-
-            for element in doc.xpath(signature_xpath):
-                element.getparent().remove(element)
-
-            cleaned_html = html.tostring(doc, encoding='unicode').strip()
-            self.description = html_sanitize(cleaned_html)
-
+            self.description = message.body
         return super()._message_post_after_hook(message)
 
     def _get_projects_to_make_billable_domain(self, additional_domain=None):
@@ -2285,8 +2283,28 @@ class ProjectTask(models.Model):
             )
             task.project_sharing_portal_user_ids = valid_collabs.mapped('partner_id.user_ids').filtered('share')
 
+    def _search_message_partner_ids(self, operator, operand):
+        """`project_task_rule_portal` OR's two sub-queries, which makes postgresql
+        seq-scan project_task instead of using its indexes. Materialize the ids of
+        each branch when there are few enough, so that it can BitmapOr them.
+        """
+        domain = super()._search_message_partner_ids(operator, operand)
+        if domain is NotImplemented or self.env.user._is_internal():
+            return domain
+        task_ids = self._search(
+            domain,
+            limit=self.env.cr.IN_MAX,
+            active_test=False,
+            bypass_access=True,
+            order=self._order,  # reason: postgresql chooses a bad plan without explicit order
+        ).get_result_ids()
+        if len(task_ids) < self.env.cr.IN_MAX:
+            domain = Domain('id', 'in', task_ids)
+        return domain
+
     def project_sharing_toggle_is_follower(self):
         self.ensure_one()
+        self.check_access('read')
         is_follower = self.message_is_follower
         if is_follower:
             self.sudo().message_unsubscribe(self.env.user.partner_id.ids)

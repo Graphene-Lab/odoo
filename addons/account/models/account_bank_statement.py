@@ -4,6 +4,7 @@ from contextlib import contextmanager
 from odoo import api, fields, models, _, Command
 from odoo.exceptions import UserError, ValidationError
 from odoo.fields import Datetime
+from odoo.tools.func import deprecated
 from odoo.tools.misc import formatLang
 
 
@@ -299,7 +300,7 @@ class AccountBankStatement(models.Model):
     def action_draft(self):
         for statement in self:
             if statement.is_journal_hash:
-                raise UserError(self.env._('The journal of this statement (%(statement_name)) is hashed, the statement cannot be reset to draft', statement_name=statement.name))
+                raise UserError(self.env._('The journal of this statement (%(statement_name)s) is hashed, the statement cannot be reset to draft', statement_name=statement.name))
             statement.is_statement_posted = False
             statement.line_ids.move_id.button_draft()
 
@@ -357,6 +358,7 @@ class AccountBankStatement(models.Model):
         res = self.env.cr.fetchall()
         return [r[0] for r in res]
 
+    @deprecated("Deprecated: should use action_open_review_statements in enterprise instead")
     def action_open_statements_to_review(self):
         self.ensure_one()
 

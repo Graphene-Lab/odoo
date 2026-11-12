@@ -386,14 +386,8 @@ export function prepareBodyForEditing(body) {
  */
 export function htmlToTextContentInline(htmlString) {
     htmlString = htmlReplace(htmlString, /<br\s*\/?>/gi, () => " ");
-    const div = document.createElement("div");
-    try {
-        setElementContent(div, htmlString);
-    } catch {
-        div.appendChild(createElementWithContent("pre", htmlString));
-    }
-    return div.textContent
-        .trim()
+    return createElementFromContent(htmlString)
+        .textContent.trim()
         .replace(/[\n\r]/g, "")
         .replace(/\s\s+/g, " ");
 }
@@ -566,7 +560,6 @@ export function inlineElement(element) {
             if ([...node.classList].some((cls) => MENTION_CLASSNAMES.has(cls))) {
                 parent.append(node);
             } else if (
-                href === "#" &&
                 Object.keys(node.dataset).some((attr) => JS_HANDLED_LINK_ATTRIBUTES.has(attr))
             ) {
                 appendText(parent, node.textContent);

@@ -87,17 +87,48 @@ class TestPartnerIdentifiers(TransactionCase):
             '12345674',
         )
 
-    def test_vat_deduces_at_en(self):
-        """Setting an Austrian VAT should automatically deduce AT_EN."""
+    def test_vat_not_deduces_at_en(self):
+        """Setting an Austrian VAT should not automatically deduce AT_EN (anymore)."""
         partner = self.env['res.partner'].create({
             'name': 'AT Partner',
             'country_id': self.env.ref('base.at').id,
         })
         partner.vat = 'ATU12345675'
-        self.assertEqual(
-            (partner.additional_identifiers or {}).get('AT_EN'),
-            'U12345675',
-        )
+        self.assertFalse((partner.additional_identifiers or {}).get('AT_EN'))
+
+    def test_vat_deduces_se_en(self):
+        """Setting a Swedish VAT should automatically deduce SE_EN, with or without the SE prefix."""
+        for vat in ('SE123456789701', '123456789701'):
+            with self.subTest(vat=vat):
+                partner = self.env['res.partner'].create({
+                    'name': 'SE Partner',
+                    'country_id': self.env.ref('base.se').id,
+                })
+                partner.vat = vat
+                self.assertEqual(
+                    (partner.additional_identifiers or {}).get('SE_EN'),
+                    '1234567897',
+                )
+
+    def test_vat_deduces_fi_en(self):
+        """Setting a Finnish VAT should automatically deduce FI_EN."""
+        partner = self.env['res.partner'].create({
+            'name': 'FI Partner',
+            'country_id': self.env.ref('base.fi').id,
+        })
+        partner.vat = 'FI01120389'
+        self.assertEqual((partner.additional_identifiers or {}).get('FI_EN'), '01120389')
+
+    def test_vat_deduces_no_en(self):
+        """Setting a Norwegian VAT should automatically deduce NO_EN, with or without the MVA suffix."""
+        for vat in ('NO974760673MVA', 'NO974760673'):
+            with self.subTest(vat=vat):
+                partner = self.env['res.partner'].create({
+                    'name': 'NO Partner',
+                    'country_id': self.env.ref('base.no').id,
+                })
+                partner.vat = vat
+                self.assertEqual((partner.additional_identifiers or {}).get('NO_EN'), '974760673')
 
     def test_unknown_key_dropped(self):
         """Unknown identifier keys should be dropped on save with a logger warning."""

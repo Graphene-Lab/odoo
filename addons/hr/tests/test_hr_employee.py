@@ -10,7 +10,7 @@ from odoo.fields import Domain
 from odoo.tests import Form, users, new_test_user, HttpCase, tagged, TransactionCase
 from odoo.addons.hr.tests.common import TestHrCommon
 from odoo.tools import mute_logger
-from odoo.exceptions import UserError, ValidationError
+from odoo.exceptions import AccessError, UserError, ValidationError
 from psycopg2.errors import NotNullViolation
 
 # 1x1 px pictures, to tell an employee's own photo from its user's avatar.
@@ -429,6 +429,25 @@ class TestHrEmployee(TestHrCommon):
         self.assertEqual(new_employee.work_contact_id, user.partner_id)
         self.assertEqual(new_employee.user_id, user)
 
+    def test_change_work_email_after_removing_user(self):
+        """ The partner of a user removed from the employee is kept, but changing the work email or phone of
+            the employee doesn't change the ones of the user. """
+        user = self.env['res.users'].create({
+            'name': 'Test User',
+            'login': 'test_user',
+            'email': 'user@example.com',
+        })
+        employee = self.env['hr.employee'].create({
+            'name': 'Test User - employee',
+            'user_id': user.id,
+        })
+        employee.user_id = None
+        employee.write({'work_email': 'employee@example.com', 'work_phone': '+32 470 00 00 00'})
+        self.assertEqual(employee.work_contact_id, user.partner_id)
+        self.assertEqual(employee.work_email, 'employee@example.com')
+        self.assertEqual(user.email, 'user@example.com')
+        self.assertFalse(user.partner_id.phone)
+
     def test_change_user_on_employee_multi_company(self):
         """
             Removing user from employee keeps the link in work_contact_id in the correct company until the user
@@ -657,6 +676,20 @@ class TestHrEmployee(TestHrCommon):
         days = employeeA._get_unusual_days(str(datetime(2025, 1, 1)), str(datetime(2025, 12, 31)))
         self.assertTrue(days)
         self.assertFalse(days['2025-01-04'])
+
+    def test_unusual_days_before_contract_start(self):
+        """
+        The days of a version before the start of its contract are unusual days.
+        """
+        employee = self.env['hr.employee'].create({
+            'name': 'Employee',
+            'date_version': datetime(2025, 1, 1),
+        })
+        employee.version_id.with_context(sync_contract_dates=True).contract_date_start = datetime(2025, 1, 15)
+        days = employee._get_unusual_days(str(datetime(2025, 1, 1)), str(datetime(2025, 1, 31)))
+        # Monday 06/01/2025 is before the contract start, Monday 20/01/2025 is in contract
+        self.assertTrue(days['2025-01-06'])
+        self.assertFalse(days['2025-01-20'])
 
     def test_user_creation_from_employee_with_invalid_email(self):
         employee = self.env['hr.employee'].create({
@@ -917,6 +950,27 @@ class TestHrEmployee(TestHrCommon):
 
         result = self.env['hr.employee'].search([('child_ids', '!=', False)])
         self.assertNotIn(employee_1, result)
+
+    def test_read_public_inherited_fields_without_hr_access(self):
+        """Users without access to hr.employee can read the public fields inherited from the
+        version, and searching on private fields raises an AccessError."""
+        job = self.env['hr.job'].create({'name': 'Public Job'})
+        department = self.env['hr.department'].create({'name': 'Public Department'})
+        employee = self.env['hr.employee'].create({
+            'name': 'Public Employee',
+            'job_id': job.id,
+            'job_title': 'Public Job Title',
+            'department_id': department.id,
+            'private_email': 'private@example.com',
+        })
+        internal_user = new_test_user(self.env, login='internal_user', groups='base.group_user')
+        self.env.invalidate_all()
+        employee_as_user = self.env['hr.employee'].with_user(internal_user).search([('id', '=', employee.id)])
+        self.assertEqual(employee_as_user.job_title, 'Public Job Title')
+        self.assertEqual(employee_as_user.job_id, job)
+        self.assertEqual(employee_as_user.department_id, department)
+        with self.assertRaises(AccessError):
+            self.env['hr.employee'].with_user(internal_user).search([('private_email', '!=', False)])
 
 
 @tagged('-at_install', 'post_install')
